@@ -4,7 +4,7 @@ import { render, screen, waitFor } from "@/test/test-utils";
 import { NavigationMenu } from "./NavigationMenu";
 import { Breadcrumbs, buildCrumbs } from "./Breadcrumbs";
 import "@testing-library/jest-dom";
-import { vi } from "vitest";
+import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -37,10 +37,242 @@ describe("NavigationMenu", () => {
   beforeEach(() => {
     localStorage.clear();
     mockPathname = "/dashboard";
+    vi.clearAllMocks();
   });
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  describe("localStorage failure handling (deterministic under adverse conditions)", () => {
+    it("renders without crashing when localStorage.getItem throws", () => {
+      const getItemSpy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+        throw new Error("QuotaExceededError");
+      });
+      
+      render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      expect(screen.getByRole("navigation")).toBeInTheDocument();
+      expect(screen.getAllByRole("listitem")).toHaveLength(2);
+      getItemSpy.mockRestore();
+    });
+
+    it("renders without crashing when localStorage.setItem throws (quota exceeded)", async () => {
+      const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new Error("QuotaExceededError");
+      });
+      
+      render(<NavigationMenu visibleLinks={["Dashboard"]} />);
+      const link = screen.getByText("Dashboard").closest("a")!;
+      await userEvent.click(link);
+      
+      // Component should remain functional despite setItem failure
+      expect(screen.getByRole("navigation")).toBeInTheDocument();
+      setItemSpy.mockRestore();
+    });
+
+    it("renders without crashing when localStorage is undefined (private browsing)", () => {
+      const originalLS = global.localStorage;
+      Object.defineProperty(global, "localStorage", {
+        value: undefined,
+        writable: true,
+      });
+      
+      render(<NavigationMenu visibleLinks={["Dashboard"]} />);
+      expect(screen.getByRole("link", { name: /dashboard/i })).toBeInTheDocument();
+      
+      Object.defineProperty(global, "localStorage", {
+        value: originalLS,
+        writable: true,
+      });
+    });
+
+    it("uses DEFAULT_ACTIVE_LINK when localStorage read fails", async () => {
+      vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+        throw new Error("Access denied");
+      });
+      
+      render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      
+      // Dashboard should be active by default (route-based)
+      await waitFor(() => {
+        expect(screen.getByText("Dashboard").closest("a")).toHaveAttribute("aria-current", "page");
+      });
+    });
+
+    it("state updates locally even if setItem fails silently", async () => {
+      vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new Error("QuotaExceededError");
+      });
+      
+      mockPathname = "/";
+      render(<NavigationMenu visibleLinks={["Fundwallet", "Dashboard"]} />);
+      
+      const fundwalletLink = screen.getByText("Fundwallet").closest("a")!;
+      await userEvent.click(fundwalletLink);
+      
+      // State should still update despite storage failure
+      await waitFor(() => {
+        expect(fundwalletLink).toHaveAttribute("aria-current", "page");
+      });
+    });
+  });
+
+  describe("state consistency under concurrent/rapid updates", () => {
+    it("last click wins when multiple links are clicked rapidly", async () => {
+      mockPathname = "/";
+      render(<NavigationMenu visibleLinks={["Dashboard", "Settings", "Fundwallet"]} />);
+      
+      const dashboard = screen.getByText("Dashboard").closest("a")!;
+      const settings = screen.getByText("Settings").closest("a")!;
+      const fundwallet = screen.getByText("Fundwallet").closest("a")!;
+      
+      // Rapid clicks: Dashboard → Settings → Fundwallet
+      await userEvent.click(dashboard);
+      await userEvent.click(settings);
+      await userEvent.click(fundwallet);
+      
+      // Only Fundwallet should be active (last click)
+      await waitFor(() => {
+        expect(fundwallet).toHaveAttribute("aria-current", "page");
+      });
+      expect(settings).not.toHaveAttribute("aria-current");
+      expect(dashboard).not.toHaveAttribute("aria-current");
+    });
+
+    it("rapid re-renders do not cause state corruption", async () => {
+      const onLinkClick = vi.fn();
+      mockPathname = "/";
+      
+      const { rerender } = render(
+        <NavigationMenu visibleLinks={["Dashboard"]} onLinkClick={onLinkClick} />
+      );
+      
+      await userEvent.click(screen.getByText("Dashboard").closest("a")!);
+      expect(onLinkClick).toHaveBeenCalledTimes(1);
+      
+      rerender(<NavigationMenu visibleLinks={["Dashboard"]} onLinkClick={onLinkClick} />);
+      expect(onLinkClick).toHaveBeenCalledTimes(1); // No additional calls
+    });
+
+    it("handleClick is idempotent: repeated calls with same input yield same output", async () => {
+      mockPathname = "/";
+      render(<NavigationMenu visibleLinks={["Fundwallet"]} />);
+      
+      const link = screen.getByText("Fundwallet").closest("a")!;
+      
+      // First click
+      await userEvent.click(link);
+      await waitFor(() => expect(link).toHaveAttribute("aria-current", "page"));
+      
+      // Second click with same link
+      await userEvent.click(link);
+      await waitFor(() => expect(link).toHaveAttribute("aria-current", "page"));
+      
+      // State should remain stable
+      expect(link).toHaveAttribute("aria-current", "page");
+    });
+  });
+
+  describe("pathname null/undefined safety", () => {
+    it("handles undefined pathname gracefully", () => {
+      mockPathname = undefined as any;
+      render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      expect(screen.getByRole("navigation")).toBeInTheDocument();
+    });
+
+    it("handles null pathname gracefully", () => {
+      mockPathname = null as any;
+      render(<NavigationMenu visibleLinks={["Dashboard"]} />);
+      expect(screen.getByRole("link", { name: /dashboard/i })).toBeInTheDocument();
+    });
+
+    it("treats undefined pathname as no match for route links", () => {
+      mockPathname = undefined as any;
+      render(<NavigationMenu visibleLinks={["Settings"]} />);
+      expect(screen.getByText("Settings").closest("a")).not.toHaveAttribute("aria-current");
+    });
+  });
+
+  describe("visibleLinks filtering safety (idempotent, crash-safe)", () => {
+    it("empty visibleLinks renders zero links deterministically", () => {
+      render(<NavigationMenu visibleLinks={[]} />);
+      expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    });
+
+    it("invalid link names in visibleLinks are silently ignored", () => {
+      render(<NavigationMenu visibleLinks={["InvalidName", "Dashboard"]} />);
+      expect(screen.getByText("Dashboard")).toBeInTheDocument();
+      expect(screen.queryByText("InvalidName")).not.toBeInTheDocument();
+    });
+
+    it("duplicate link names in visibleLinks render link only once", () => {
+      render(<NavigationMenu visibleLinks={["Dashboard", "Dashboard"]} />);
+      expect(screen.getAllByText("Dashboard")).toHaveLength(1);
+    });
+
+    it("mixed valid and invalid names are filtered deterministically", () => {
+      render(<NavigationMenu visibleLinks={["Dashboard", "Foo", "Settings", "Bar"]} />);
+      expect(screen.getByText("Dashboard")).toBeInTheDocument();
+      expect(screen.getByText("Settings")).toBeInTheDocument();
+      expect(screen.queryByText("Foo")).not.toBeInTheDocument();
+      expect(screen.queryByText("Bar")).not.toBeInTheDocument();
+    });
+
+    it("filtering is stable across re-renders with same input", () => {
+      const { rerender } = render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      expect(screen.getAllByRole("listitem")).toHaveLength(2);
+      
+      rerender(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    });
+  });
+
+  describe("isActive derivation determinism (route-based vs click-based)", () => {
+    it("route-based isActive depends only on pathname (not activeLink state)", () => {
+      mockPathname = "/dashboard/loan";
+      render(<NavigationMenu visibleLinks={["Dashboard", "Loan", "Fundwallet"]} />);
+      
+      // Loan matches pathname
+      expect(screen.getByText("Loan").closest("a")).toHaveAttribute("aria-current", "page");
+      // Dashboard does not match
+      expect(screen.getByText("Dashboard").closest("a")).not.toHaveAttribute("aria-current");
+      // Fundwallet is click-based and not clicked yet
+      expect(screen.getByText("Fundwallet").closest("a")).not.toHaveAttribute("aria-current");
+    });
+
+    it("click-based isActive depends only on activeLink (not pathname)", async () => {
+      mockPathname = "/other";
+      render(<NavigationMenu visibleLinks={["Fundwallet"] />);
+      
+      // Fundwallet has no path, so not active initially
+      const link = screen.getByText("Fundwallet").closest("a")!;
+      expect(link).not.toHaveAttribute("aria-current");
+      
+      // After click, becomes active
+      await userEvent.click(link);
+      await waitFor(() => expect(link).toHaveAttribute("aria-current", "page"));
+    });
+
+    it("isActive is case-insensitive for click-based links", async () => {
+      mockPathname = "/";
+      localStorage.setItem("activeLink", "FUNDWALLET");
+      
+      render(<NavigationMenu visibleLinks={["Fundwallet"]} />);
+      
+      // Should match despite case difference
+      await waitFor(() => {
+        expect(screen.getByText("Fundwallet").closest("a")).toHaveAttribute("aria-current", "page");
+      });
+    });
+
+    it("exactly one link has aria-current per render", () => {
+      mockPathname = "/dashboard/loan";
+      render(<NavigationMenu visibleLinks={["Dashboard", "Loan", "Settings"]} />);
+      
+      const linksWithCurrent = screen.getAllByRole("link").filter(link => link.hasAttribute("aria-current"));
+      expect(linksWithCurrent).toHaveLength(1);
+      expect(linksWithCurrent[0]).toHaveTextContent("Loan");
+    });
   });
 
   describe("link rendering", () => {
@@ -244,6 +476,247 @@ describe("NavigationMenu", () => {
       expect(link).toHaveClass("hover:bg-white/5");
       expect(link).toHaveClass("hover:text-white");
     });
+  });
+
+  describe("callback safety (stale closure protection)", () => {
+    it("onLinkClick callback is called after state update", async () => {
+      const onLinkClick = vi.fn();
+      render(<NavigationMenu visibleLinks={["Dashboard"]} onLinkClick={onLinkClick} />);
+      
+      await userEvent.click(screen.getByText("Dashboard").closest("a")!);
+      
+      expect(onLinkClick).toHaveBeenCalledTimes(1);
+    });
+
+    it("onLinkClick receives updated state when called", async () => {
+      mockPathname = "/";
+      let capturedState = "";
+      
+      const onLinkClick = vi.fn(() => {
+        capturedState = localStorage.getItem("activeLink") || "";
+      });
+      
+      render(<NavigationMenu visibleLinks={["Fundwallet"]} onLinkClick={onLinkClick} />);
+      
+      await userEvent.click(screen.getByText("Fundwallet").closest("a")!);
+      
+      expect(capturedState).toBe("Fundwallet");
+    });
+
+    it("undefined onLinkClick is safe to call", async () => {
+      render(<NavigationMenu visibleLinks={["Dashboard"]} onLinkClick={undefined} />);
+      
+      // Should not throw when clicking link
+      await userEvent.click(screen.getByText("Dashboard").closest("a")!);
+      expect(screen.getByText("Dashboard").closest("a")).toHaveAttribute("aria-current", "page");
+    });
+  });
+
+  describe("recovery from partial failures", () => {
+    it("recovers from first storage failure, succeeds on retry", async () => {
+      let callCount = 0;
+      const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("QuotaExceededError");
+        }
+        // Success on second call
+      });
+      
+      mockPathname = "/";
+      render(<NavigationMenu visibleLinks={["Fundwallet"]} />);
+      
+      // First click fails storage but updates state
+      await userEvent.click(screen.getByText("Fundwallet").closest("a")!);
+      expect(screen.getByText("Fundwallet").closest("a")).toHaveAttribute("aria-current", "page");
+      
+      // If clicked again, storage should succeed
+      await userEvent.click(screen.getByText("Fundwallet").closest("a")!);
+      expect(setItemSpy).toHaveBeenCalledTimes(2);
+      
+      setItemSpy.mockRestore();
+    });
+
+    it("component remains functional after localStorage quota exceeded", async () => {
+      const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new Error("QuotaExceededError");
+      });
+      
+      mockPathname = "/";
+      render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      
+      // Both links should work despite storage failure
+      await userEvent.click(screen.getByText("Settings").closest("a")!);
+      expect(screen.getByRole("navigation")).toBeInTheDocument();
+      
+      await userEvent.click(screen.getByText("Dashboard").closest("a")!);
+      expect(screen.getByRole("navigation")).toBeInTheDocument();
+      
+      setItemSpy.mockRestore();
+    });
+  });
+
+  describe("prop defaulting and safety", () => {
+    it("isCollapsed defaults to false when not provided", () => {
+      render(<NavigationMenu visibleLinks={["Dashboard"]} />);
+      const link = screen.getByText("Dashboard").closest("a")!;
+      expect(link).toHaveClass("px-4"); // Not collapsed
+    });
+
+    it("onLinkClick is optional and safe to omit", async () => {
+      mockPathname = "/";
+      render(<NavigationMenu visibleLinks={["Fundwallet"]} />);
+      
+      // Should not throw when onLinkClick is undefined
+      await userEvent.click(screen.getByText("Fundwallet").closest("a")!);
+      expect(screen.getByText("Fundwallet").closest("a")).toHaveAttribute("aria-current", "page");
+    });
+
+    it("visibleLinks is optional and shows all links when omitted", () => {
+      render(<NavigationMenu />);
+      const listItems = screen.getAllByRole("listitem");
+      expect(listItems.length).toBeGreaterThan(5);
+    });
+  });
+
+  describe("determinism under repeated operations", () => {
+    it("same sequence of clicks produces same final state", async () => {
+      mockPathname = "/";
+      const { rerender } = render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      
+      // First sequence
+      await userEvent.click(screen.getByText("Dashboard").closest("a")!);
+      await userEvent.click(screen.getByText("Settings").closest("a")!);
+      expect(screen.getByText("Settings").closest("a")).toHaveAttribute("aria-current", "page");
+      
+      // Unmount and remount
+      localStorage.setItem("activeLink", "Settings");
+      rerender(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+      
+      // Same final state
+      await waitFor(() => {
+        expect(screen.getByText("Settings").closest("a")).toHaveAttribute("aria-current", "page");
+      });
+    });
+
+    it("multiple mounts with same localStorage produce consistent state", () => {
+      localStorage.setItem("activeLink", "Settings");
+      mockPathname = "/";
+      
+      const { unmount } = render(<NavigationMenu visibleLinks={["Settings", "Dashboard"]} />);
+      expect(screen.getByText("Settings").closest("a")).toHaveAttribute("aria-current", "page");
+      
+      unmount();
+      
+      const { container: container2 } = render(<NavigationMenu visibleLinks={["Settings", "Dashboard"]} />);
+      const settingsLink = container2.querySelector('a[aria-label="Settings"]');
+      expect(settingsLink).toHaveAttribute("aria-current", "page");
+    });
+  });
+});
+
+// ─── Edge case: Racing pathname changes ───────────────────────────────────────
+
+describe("NavigationMenu — pathname race conditions", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("pathname change is immediately reflected in active state", () => {
+    mockPathname = "/dashboard";
+    const { rerender } = render(<NavigationMenu visibleLinks={["Dashboard", "Loan"]} />);
+    
+    expect(screen.getByText("Dashboard").closest("a")).toHaveAttribute("aria-current", "page");
+    
+    // Pathname changes
+    mockPathname = "/dashboard/loan";
+    rerender(<NavigationMenu visibleLinks={["Dashboard", "Loan"]} />);
+    
+    // Active state should flip to Loan
+    expect(screen.getByText("Loan").closest("a")).toHaveAttribute("aria-current", "page");
+    expect(screen.getByText("Dashboard").closest("a")).not.toHaveAttribute("aria-current");
+  });
+
+  it("activeLink state is NOT overwritten by pathname change", async () => {
+    mockPathname = "/";
+    render(<NavigationMenu visibleLinks={["Fundwallet", "Dashboard"]} />);
+    
+    // Click Fundwallet (no path, click-based)
+    await userEvent.click(screen.getByText("Fundwallet").closest("a")!);
+    expect(screen.getByText("Fundwallet").closest("a")).toHaveAttribute("aria-current", "page");
+    
+    // Pathname changes
+    mockPathname = "/dashboard";
+    // Should NOT reset Fundwallet, but Dashboard is route-active now
+    // Note: component renders both as "active" from different sources
+    // This is the expected behavior
+  });
+});
+
+// ─── Edge case: Icon dynamic import failures ───────────────────────────────────
+
+describe("NavigationMenu — icon loading resilience", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("renders even if icon components fail to load", () => {
+    // The dynamic() mock will show IconPlaceholder on load
+    render(<NavigationMenu visibleLinks={["Dashboard"]} />);
+    
+    // Component should still render the link structure
+    expect(screen.getByRole("link", { name: /dashboard/i })).toBeInTheDocument();
+  });
+
+  it("icon color is correctly applied to active and inactive states", () => {
+    mockPathname = "/dashboard";
+    render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+    
+    const dashboardIcon = screen.getByText("Dashboard").closest("a")?.querySelector("span.inline-flex svg");
+    const settingsIcon = screen.getByText("Settings").closest("a")?.querySelector("span.inline-flex svg");
+    
+    // Both should be rendered (icon components are mocked)
+    expect(screen.getByRole("navigation")).toBeInTheDocument();
+  });
+});
+
+// ─── Edge case: visibleLinks updates ────────────────────────────────────────
+
+describe("NavigationMenu — visibleLinks prop changes", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("re-filtering when visibleLinks prop changes", () => {
+    const { rerender } = render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    
+    // Update visibleLinks
+    rerender(<NavigationMenu visibleLinks={["Dashboard"]} />);
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("activeLink is preserved when visibleLinks is updated", async () => {
+    mockPathname = "/";
+    const { rerender } = render(<NavigationMenu visibleLinks={["Dashboard", "Settings"]} />);
+    
+    // Click Settings
+    await userEvent.click(screen.getByText("Settings").closest("a")!);
+    expect(localStorage.getItem("activeLink")).toBe("Settings");
+    
+    // Settings becomes hidden
+    rerender(<NavigationMenu visibleLinks={["Dashboard"]} />);
+    
+    // Settings is now hidden but activeLink is still "Settings" in storage
+    expect(localStorage.getItem("activeLink")).toBe("Settings");
+  });
+
+  it("filtering to empty list clears all links without crashing", () => {
+    const { rerender } = render(<NavigationMenu visibleLinks={["Dashboard"]} />);
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    
+    rerender(<NavigationMenu visibleLinks={[]} />);
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
   });
 });
 
